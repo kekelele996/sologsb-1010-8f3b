@@ -52,12 +52,54 @@ export interface ProofIssue {
   resolved: boolean;
 }
 
+export interface ArchiveRuleSet {
+  id: string;
+  name: string;
+  description: string;
+  contractions: boolean;
+  hyphenMode: 'cross-line' | 'inline';
+  rules: TranscriptionRule[];
+}
+
+export interface RuleArchive {
+  format: 'braille-atelier-rules';
+  version: number;
+  exportedAt: string;
+  school: string;
+  teacher: string;
+  note: string;
+  ruleSets: ArchiveRuleSet[];
+}
+
+export interface ArchiveMergeStats {
+  added: number;
+  replaced: number;
+  conflictsTaken: number;
+  conflictsKept: number;
+  settingsApplied: number;
+  newSets: number;
+}
+
+export interface RuleArchiveRecord {
+  id: string;
+  direction: 'export' | 'import';
+  at: string;
+  school: string;
+  teacher: string;
+  note: string;
+  fileName: string;
+  setCount: number;
+  ruleCount: number;
+  stats?: ArchiveMergeStats;
+  payload: RuleArchive;
+}
+
 export interface VersionSnapshot {
   id: string;
   name: string;
   createdAt: string;
   action: string;
-  snapshot: Omit<ProjectState, 'versions'>;
+  snapshot: Omit<ProjectState, 'versions' | 'ruleArchives'>;
 }
 
 export interface ProjectState {
@@ -70,6 +112,7 @@ export interface ProjectState {
   selectedLineId: string;
   issues: ProofIssue[];
   versions: VersionSnapshot[];
+  ruleArchives: RuleArchiveRecord[];
   lastCheckedAt: string;
   updatedAt: string;
 }

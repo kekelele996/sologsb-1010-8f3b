@@ -1,8 +1,19 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { makeArchiveRecord, mergeArchive } from './archive';
+import type { ArchiveDiff } from './archive';
+import ArchiveDialog from './ArchiveDialog';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type {
+  HistoryState,
+  ProofIssue,
+  ProjectState,
+  RuleArchive,
+  RuleArchiveRecord,
+  TextbookLine,
+  VersionSnapshot,
+} from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -55,7 +66,7 @@ function loadInitialState(): ProjectState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      return analyzeProject({ ...parsed, ruleArchives: Array.isArray(parsed.ruleArchives) ? parsed.ruleArchives : [] });
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -482,6 +493,7 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -549,7 +561,7 @@ export default function App() {
   });
 
   const createSnapshot = (action: string, source = state): VersionSnapshot => {
-    const { versions: _versions, ...snapshot } = cloneState(source);
+    const { versions: _versions, ruleArchives: _ruleArchives, ...snapshot } = cloneState(source);
     return {
       id: `version-${Date.now().toString(36)}`,
       name: `${action} · ${source.lines.filter((line) => line.status === 'approved').length}/${source.lines.length} 行完成`,
@@ -561,6 +573,38 @@ export default function App() {
 
   const recordVersion = (action = '手动记录') => {
     commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(action, current), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
+  };
+
+  const exportArchiveRecord = (archive: RuleArchive, fileName: string) => {
+    const record = makeArchiveRecord('export', archive, fileName);
+    commit('导出规则档案', (current) => ({
+      ...current,
+      ruleArchives: [record, ...(current.ruleArchives ?? [])].slice(0, 50),
+      updatedAt: new Date().toISOString(),
+    }));
+  };
+
+  const importArchive = (diff: ArchiveDiff, record: RuleArchiveRecord) => {
+    const merged = mergeArchive(state, diff);
+    commit('接收规则档案并重转录全文', (current) => {
+      const { state: nextRules, stats } = mergeArchive(current, diff);
+      const analyzed = analyzeProject(nextRules);
+      return {
+        ...analyzed,
+        ruleArchives: [{ ...record, stats }, ...(current.ruleArchives ?? [])].slice(0, 50),
+        versions: [createSnapshot('接收规则档案', analyzed), ...current.versions].slice(0, 20),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    return merged.stats;
+  };
+
+  const deleteArchiveRecord = (recordId: string) => {
+    commit('删除互传记录', (current) => ({
+      ...current,
+      ruleArchives: (current.ruleArchives ?? []).filter((record) => record.id !== recordId),
+      updatedAt: new Date().toISOString(),
+    }));
   };
 
   const exportText = () => {
@@ -628,6 +672,7 @@ export default function App() {
         <div class="topbar-actions">
           <md-icon-button onClick={undo} disabled={history.past.length === 0} aria-label="撤销" title="撤销 ⌘Z">↶</md-icon-button>
           <md-icon-button onClick={redo} disabled={history.future.length === 0} aria-label="重做" title="重做 ⇧⌘Z">↷</md-icon-button>
+          <md-outlined-button onClick={() => setArchiveOpen(true)}>规则档案</md-outlined-button>
           <md-outlined-button onClick={exportText}>导出文本</md-outlined-button>
           <md-filled-button onClick={exportPrint}>打印版导出</md-filled-button>
         </div>
@@ -708,11 +753,20 @@ export default function App() {
             }));
           }} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
-            const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
+            const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions, ruleArchives: state.ruleArchives });
             restore(restored);
           }} />}
         </aside>
       </div>
+
+      <ArchiveDialog
+        open={archiveOpen}
+        state={state}
+        onClose={() => setArchiveOpen(false)}
+        onExportArchive={exportArchiveRecord}
+        onImportArchive={importArchive}
+        onDeleteRecord={deleteArchiveRecord}
+      />
     </div>
   );
 }
