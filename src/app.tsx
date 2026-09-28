@@ -1,8 +1,31 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import {
+  CHANGED_FIELD_LABELS,
+  KIND_LABELS,
+  NEW_TARGET,
+  SETTING_LABELS,
+  createArchive,
+  diffRuleSets,
+  mergeRuleSet,
+  parseArchive,
+  serializeArchive,
+  settingDisplay,
+  suggestArchiveTarget,
+  uniqueRuleSetName,
+} from './archive';
+import type {
+  MergeSelection,
+  ParseResult,
+  RuleComparison,
+  RuleSetArchive,
+  RuleSetDiff,
+  SettingKey,
+  SideChoice,
+} from './archive';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, ProofIssue, ProjectState, RuleSet, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -115,6 +138,8 @@ function RuleSetPanel({
   onToggleContractions,
   onAddRule,
   onRecheck,
+  onExportArchive,
+  onImportArchive,
 }: {
   state: ProjectState;
   onSelect: (id: string) => void;
@@ -122,6 +147,8 @@ function RuleSetPanel({
   onToggleContractions: () => void;
   onAddRule: (source: string, output: string, suspicious: boolean) => void;
   onRecheck: () => void;
+  onExportArchive: () => void;
+  onImportArchive: () => void;
 }) {
   const active = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const [showAllRules, setShowAllRules] = useState(false);
@@ -144,6 +171,14 @@ function RuleSetPanel({
             </button>
           ))}
         </div>
+      </Section>
+
+      <Section title="规则档案互传" subtitle="把校订好的整套规则发给同校老师，或接收对方的档案">
+        <div class="archive-actions">
+          <md-outlined-button onClick={onImportArchive}>接收档案…</md-outlined-button>
+          <md-filled-tonal-button onClick={onExportArchive}>导出「{active.name}」档案</md-filled-tonal-button>
+        </div>
+        <p class="archive-actions-hint">档案包含规则集说明、缩写开关、断词方式和全部规则（含停用与可疑标记）。</p>
       </Section>
 
       <Section
@@ -479,9 +514,365 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+interface ArchiveSelectionState {
+  targetId: string;
+  decisions: Record<string, SideChoice>;
+  included: Record<string, boolean>;
+  settings: Partial<Record<SettingKey, SideChoice>>;
+}
+
+function ArchiveDialog({
+  state,
+  onClose,
+  onApply,
+}: {
+  state: ProjectState;
+  onClose: () => void;
+  onApply: (archive: RuleSetArchive, targetId: string, selection: MergeSelection) => void;
+}) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [parse, setParse] = useState<ParseResult | null>(null);
+  const [selectionState, setSelectionState] = useState<ArchiveSelectionState | null>(null);
+  const [pasteText, setPasteText] = useState('');
+
+  const archive = parse?.ok ? parse.archive : undefined;
+  const archiveWarnings = parse?.warnings ?? [];
+  const target: RuleSet | undefined = selectionState && selectionState.targetId !== NEW_TARGET
+    ? state.ruleSets.find((set) => set.id === selectionState.targetId)
+    : undefined;
+  const diff: RuleSetDiff | null = archive ? diffRuleSets(target, archive.ruleSet) : null;
+
+  const loadArchiveText = (raw: string) => {
+    const result = parseArchive(raw);
+    setParse(result);
+    setPasteText('');
+    if (result.ok && result.archive) {
+      setSelectionState({
+        targetId: suggestArchiveTarget(state.ruleSets, result.archive),
+        decisions: {},
+        included: {},
+        settings: { description: 'incoming', contractions: 'incoming', hyphenMode: 'incoming' },
+      });
+    }
+  };
+
+  const onFile = (file: File | undefined) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => loadArchiveText(String(reader.result ?? ''));
+    reader.onerror = () => setParse({ ok: false, errors: ['读取档案文件失败，请重新发送方获取文件。'], warnings: [] });
+    reader.readAsText(file);
+  };
+
+  const chooseAllConflicts = (choice: SideChoice) => {
+    if (!diff || !selectionState) return;
+    const decisions = { ...selectionState.decisions };
+    diff.conflicts.forEach((item) => { decisions[item.key] = choice; });
+    setSelectionState({ ...selectionState, decisions });
+  };
+
+  const setAllAdded = (included: boolean) => {
+    if (!diff || !selectionState) return;
+    const next = { ...selectionState.included };
+    diff.added.forEach((item) => { next[item.key] = included; });
+    setSelectionState({ ...selectionState, included: next });
+  };
+
+  const resolvedConflicts = diff?.conflicts.filter((item) => selectionState?.decisions[item.key]).length ?? 0;
+  const acceptedAdded = diff?.added.filter((item) => selectionState?.included[item.key] !== false).length ?? 0;
+  const canApply = Boolean(diff && selectionState && resolvedConflicts === diff.conflicts.length && (target || acceptedAdded > 0));
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      const activeTag = (event.target as HTMLElement)?.tagName;
+      if (activeTag !== 'INPUT' && activeTag !== 'TEXTAREA') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  const incomingLabel = archive ? `档案 · ${archive.exporter}` : '档案';
+
+  return (
+    <div class="modal-backdrop" onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div class="archive-dialog" role="dialog" aria-modal="true" aria-label="接收规则档案">
+        <div class="archive-dialog-head">
+          <div>
+            <span class="eyebrow">规则档案互传</span>
+            <h2>接收校订后的规则档案</h2>
+            <p>先查看新增、替换和冲突；确认前当前项目保持原样。</p>
+          </div>
+          <md-icon-button aria-label="关闭" title="关闭（Esc）" onClick={onClose}>×</md-icon-button>
+        </div>
+
+        {!archive && (
+          <div class="archive-dialog-body scroll-pane">
+            {parse && !parse.ok && (
+              <div class="archive-alert error">
+                <strong>无法读取档案</strong>
+                {parse.errors.map((message) => <p key={message}>{message}</p>)}
+              </div>
+            )}
+            {parse?.ok === false && parse.warnings.length > 0 && (
+              <ul class="archive-alert-list">{parse.warnings.map((message) => <li>{message}</li>)}</ul>
+            )}
+            <div class="archive-dropzone">
+              <span aria-hidden="true">⇪</span>
+              <strong>选择规则档案文件</strong>
+              <p>由其他老师在“导出规则档案”中生成的 .json 文件。</p>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,application/json"
+                style={{ display: 'none' }}
+                onChange={(event: any) => onFile(event.currentTarget.files?.[0])}
+              />
+              <md-filled-button onClick={() => fileInputRef.current?.click()}>选择文件</md-filled-button>
+            </div>
+            <div class="archive-paste">
+              <md-outlined-text-field
+                type="textarea"
+                rows={4}
+                value={pasteText}
+                label="或把档案全文粘贴到这里"
+                onInput={(event: any) => setPasteText(event.currentTarget.value)}
+              />
+              <md-text-button disabled={!pasteText.trim()} onClick={() => loadArchiveText(pasteText)}>解析粘贴内容</md-text-button>
+            </div>
+          </div>
+        )}
+
+        {archive && diff && selectionState && (
+          <div class="archive-dialog-body scroll-pane">
+            <div class="archive-meta">
+              <div>
+                <strong>{archive.ruleSet.name}</strong>
+                <p>
+                  来源项目：{archive.sourceProject} · 校订者：{archive.exporter}
+                  {archive.exportedAt && Number.isFinite(Date.parse(archive.exportedAt)) ? ` · 导出于 ${formatTime(archive.exportedAt)}` : ''}
+                </p>
+                <p class="archive-meta-stats">
+                  共 {archive.ruleSet.rules.length} 条规则 ·
+                  {' '}缩写{archive.ruleSet.contractions ? '开' : '关'} ·
+                  {' '}{archive.ruleSet.hyphenMode === 'cross-line' ? '跨行断词' : '行内连字符'}
+                </p>
+              </div>
+              <div>
+                <label class="archive-target-label" for="archive-target">合并到</label>
+                <select
+                  id="archive-target"
+                  class="archive-target-select"
+                  value={selectionState.targetId}
+                  onChange={(event: any) => setSelectionState({
+                    ...selectionState,
+                    targetId: event.currentTarget.value,
+                    decisions: {},
+                    included: {},
+                  })}
+                >
+                  {state.ruleSets.map((set) => (
+                    <option value={set.id} key={set.id}>
+                      {set.id === archive.ruleSet.id || set.name === archive.ruleSet.name ? '◆ ' : ''}{set.name}
+                    </option>
+                  ))}
+                  <option value={NEW_TARGET}>＋ 作为新规则集导入（不动现有规则）</option>
+                </select>
+              </div>
+            </div>
+
+            {archiveWarnings.length > 0 && (
+              <div class="archive-alert warning">
+                <strong>档案有 {archiveWarnings.length} 条提示（已自动处理）</strong>
+                <ul class="archive-alert-list">
+                  {archiveWarnings.map((message) => <li key={message}>{message}</li>)}
+                </ul>
+              </div>
+            )}
+
+            {!target && (
+              <div class="archive-alert info">
+                <strong>将作为全新规则集“{uniqueRuleSetName(state.ruleSets.map((set) => set.name), archive.ruleSet.name)}”加入</strong>
+                <p>现有三套规则与课文均不改变；确认后可在左栏切换到它，切换会重转录全文。规则集说明、缩写开关和断词方式全部采用档案。</p>
+              </div>
+            )}
+
+            {target && diff.settingDiffs.length > 0 && (
+              <div class="archive-section">
+                <h3>规则集设置差异（{diff.settingDiffs.length}）</h3>
+                <div class="archive-setting-list">
+                  {diff.settingDiffs.map((item) => {
+                    const choice = selectionState.settings[item.key] ?? 'incoming';
+                    return (
+                      <div class="archive-setting-row" key={item.key}>
+                        <div class="archive-setting-label">{SETTING_LABELS[item.key]}</div>
+                        <div class="side-cards">
+                          <button
+                            class={`side-card local ${choice === 'local' ? 'picked' : ''}`}
+                            onClick={() => setSelectionState({ ...selectionState, settings: { ...selectionState.settings, [item.key]: 'local' } })}
+                          >
+                            <small>本项目</small>
+                            <span>{settingDisplay(item.key, item.local)}</span>
+                          </button>
+                          <span class="side-arrow">→</span>
+                          <button
+                            class={`side-card incoming ${choice === 'incoming' ? 'picked' : ''}`}
+                            onClick={() => setSelectionState({ ...selectionState, settings: { ...selectionState.settings, [item.key]: 'incoming' } })}
+                          >
+                            <small>{incomingLabel}</small>
+                            <span>{settingDisplay(item.key, item.incoming)}</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div class="archive-section">
+              <div class="archive-section-head">
+                <h3>新增规则（{diff.added.length}）</h3>
+                {diff.added.length > 0 && (
+                  <div class="archive-bulk">
+                    <md-text-button onClick={() => setAllAdded(true)}>全部接收</md-text-button>
+                    <md-text-button onClick={() => setAllAdded(false)}>全部舍弃</md-text-button>
+                  </div>
+                )}
+              </div>
+              {diff.added.length === 0 && <p class="archive-empty-line">档案中没有本项目缺少的规则。</p>}
+              {diff.added.map((item) => {
+                const included = selectionState.included[item.key] !== false;
+                return (
+                  <div
+                    class={`archive-rule-row added ${included ? '' : 'discarded'}`}
+                    key={item.key}
+                    role="checkbox"
+                    aria-checked={included}
+                    tabIndex={0}
+                    onClick={() => setSelectionState({ ...selectionState, included: { ...selectionState.included, [item.key]: !included } })}
+                    onKeyDown={(event: KeyboardEvent) => {
+                      if (event.key === ' ' || event.key === 'Enter') {
+                        event.preventDefault();
+                        setSelectionState({ ...selectionState, included: { ...selectionState.included, [item.key]: !included } });
+                      }
+                    }}
+                  >
+                    <md-checkbox checked={included} style={{ pointerEvents: 'none' }} />
+                    <span class="rule-kind-tag">{KIND_LABELS[item.kind]}</span>
+                    <span class="rule-text"><b>{item.incoming?.source}</b> → {item.incoming?.output}</span>
+                    <span class="rule-source-tag incoming">仅{incomingLabel}有</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div class="archive-section">
+              <div class="archive-section-head">
+                <h3>冲突 · 原文相同但盲文或设置不同（{diff.conflicts.length}）</h3>
+                {diff.conflicts.length > 0 && (
+                  <div class="archive-bulk">
+                    <md-text-button onClick={() => chooseAllConflicts('local')}>全部保留本项目</md-text-button>
+                    <md-text-button onClick={() => chooseAllConflicts('incoming')}>全部采用档案</md-text-button>
+                  </div>
+                )}
+              </div>
+              {diff.conflicts.length === 0 && <p class="archive-empty-line">没有冲突条目。</p>}
+              {diff.conflicts.map((item) => {
+                const choice = selectionState.decisions[item.key];
+                return (
+                  <div class={`conflict-block ${choice ? '' : 'undecided'}`} key={item.key}>
+                    <div class="conflict-head">
+                      <span class="rule-kind-tag">{KIND_LABELS[item.kind]}</span>
+                      <strong>{item.source}</strong>
+                      <span class="conflict-tags">
+                        {item.changedFields.map((field) => <span class="conflict-field-tag" key={field}>{CHANGED_FIELD_LABELS[field]}</span>)}
+                      </span>
+                      {!choice && <span class="conflict-pending">请选择保留哪条</span>}
+                    </div>
+                    <div class="side-cards">
+                      <button
+                        class={`side-card local ${choice === 'local' ? 'picked' : ''}`}
+                        onClick={() => setSelectionState({ ...selectionState, decisions: { ...selectionState.decisions, [item.key]: 'local' } })}
+                      >
+                        <small>本项目 · {state.author}</small>
+                        <span class="side-braille">{item.local?.output}</span>
+                        <span class="side-meta">{item.local?.enabled === false ? '已停用 · ' : ''}{item.local?.suspicious ? '可疑 · ' : ''}{item.local?.description || '无说明'}</span>
+                      </button>
+                      <button
+                        class={`side-card incoming ${choice === 'incoming' ? 'picked' : ''}`}
+                        onClick={() => setSelectionState({ ...selectionState, decisions: { ...selectionState.decisions, [item.key]: 'incoming' } })}
+                      >
+                        <small>{incomingLabel}</small>
+                        <span class="side-braille">{item.incoming?.output}</span>
+                        <span class="side-meta">{item.incoming?.enabled === false ? '已停用 · ' : ''}{item.incoming?.suspicious ? '可疑 · ' : ''}{item.incoming?.description || '无说明'}</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <details class="archive-section archive-details">
+              <summary>原文与盲文完全一致（{diff.same.length}）</summary>
+              {diff.same.map((item) => (
+                <div class="archive-rule-row same" key={item.key}>
+                  <span class="rule-kind-tag">{KIND_LABELS[item.kind]}</span>
+                  <span class="rule-text"><b>{item.source}</b> → {item.local?.output}</span>
+                  <span class="rule-source-tag same">双方一致</span>
+                </div>
+              ))}
+            </details>
+
+            {target && (
+              <details class="archive-section archive-details">
+                <summary>本项目独有（{diff.localOnly.length}，合并后始终保留）</summary>
+                {diff.localOnly.length === 0 && <p class="archive-empty-line">无。</p>}
+                {diff.localOnly.map((item: RuleComparison) => (
+                  <div class="archive-rule-row local-only" key={item.key}>
+                    <span class="rule-kind-tag">{KIND_LABELS[item.kind]}</span>
+                    <span class="rule-text"><b>{item.source}</b> → {item.local?.output}</span>
+                    <span class="rule-source-tag local">仅本项目有</span>
+                  </div>
+                ))}
+              </details>
+            )}
+          </div>
+        )}
+
+        <div class="archive-dialog-foot">
+          {archive && diff && (
+            <div class="archive-foot-summary">
+              {target
+                ? `新增 ${diff.added.length}（接收 ${acceptedAdded}） · 冲突 ${diff.conflicts.length}（已决 ${resolvedConflicts}） · 一致 ${diff.same.length} · 本项目独有 ${diff.localOnly.length}`
+                : `新规则集 ${acceptedAdded} 条规则 · 缩写${archive.ruleSet.contractions ? '开' : '关'} · ${archive.ruleSet.hyphenMode === 'cross-line' ? '跨行断词' : '行内连字符'}`}
+            </div>
+          )}
+          <div class="archive-foot-actions">
+            <md-text-button onClick={onClose}>{archive ? '取消（项目保持原样）' : '关闭'}</md-text-button>
+            {archive && selectionState && (
+              <md-filled-button
+                disabled={!canApply}
+                onClick={() => onApply(archive, selectionState.targetId, {
+                  decisions: selectionState.decisions,
+                  included: selectionState.included,
+                  settings: selectionState.settings,
+                })}
+              >
+                确认合并并重转录全文
+              </md-filled-button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -591,6 +982,42 @@ export default function App() {
     });
   };
 
+  const exportArchive = () => {
+    const archive = createArchive(activeRuleSet, { exporter: state.author, sourceProject: state.title });
+    const blob = new Blob([serializeArchive(archive)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `规则档案-${activeRuleSet.name.replace(/[^\p{L}\p{N}]+/gu, '-')}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const applyArchive = (archive: RuleSetArchive, targetId: string, selection: MergeSelection) => {
+    commit('接收规则档案并合并', (current) => {
+      let mergedSet: RuleSet;
+      let mergedId: string;
+      if (targetId === NEW_TARGET) {
+        const base = mergeRuleSet(undefined, archive.ruleSet, selection);
+        mergedId = `ruleset-import-${Date.now().toString(36)}`;
+        mergedSet = {
+          ...base,
+          id: mergedId,
+          name: uniqueRuleSetName(current.ruleSets.map((set) => set.name), archive.ruleSet.name),
+        };
+      } else {
+        const local = current.ruleSets.find((set) => set.id === targetId) ?? current.ruleSets[0];
+        mergedId = local.id;
+        mergedSet = mergeRuleSet(local, archive.ruleSet, selection);
+      }
+      const ruleSets = targetId === NEW_TARGET
+        ? [...current.ruleSets, mergedSet]
+        : current.ruleSets.map((set) => (set.id === mergedId ? mergedSet : set));
+      return analyzeProject({ ...current, ruleSets, activeRuleSetId: mergedId });
+    });
+    setArchiveDialogOpen(false);
+  };
+
   const batchFixRule = (ruleId: string) => {
     commit('批量修正同类问题', (current) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
@@ -660,6 +1087,8 @@ export default function App() {
             }));
           }}
           onRecheck={() => commit('重新检查全部内容', analyzeProject)}
+          onExportArchive={exportArchive}
+          onImportArchive={() => setArchiveDialogOpen(true)}
         />
 
         <EditorPanel
@@ -713,6 +1142,14 @@ export default function App() {
           }} />}
         </aside>
       </div>
+
+      {archiveDialogOpen && (
+        <ArchiveDialog
+          state={state}
+          onClose={() => setArchiveDialogOpen(false)}
+          onApply={applyArchive}
+        />
+      )}
     </div>
   );
 }
